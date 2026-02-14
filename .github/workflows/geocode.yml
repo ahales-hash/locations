@@ -1,11 +1,89 @@
 name: Geocode with Azure Maps
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Run manually from the Actions tab
 
 jobs:
-  ping:
+  geocode:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Say hello
-        run: echo "✅ Geocode workflow can run jobs"
+      # 1) Pull your repository files
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2) Install Python 3.11
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3) Install the few packages the script needs
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl requests
+
+      # 4) Verify both required files are present at the REPO ROOT
+      - name: Verify input files exist
+        run: |
+          echo "Listing repo files:"
+          ls -la
+          if [ ! -f "azure_maps_batch_geocode_and_merge.py" ]; then
+            echo "❌ Missing: azure_maps_batch_geocode_and_merge.py at repo root"
+            exit 1
+          fi
+          if [ ! -f "Locations_geocode_ready.xlsx" ]; then
+            echo "❌ Missing: Locations_geocode_ready.xlsx at repo root"
+            exit 1
+          fi
+          echo "✔️ Both files found."
+
+      # 5) (Optional but helpful) Probe your Azure Maps key BEFORE running the big batch
+      - name: Probe Azure Maps key (sanity test)
+        env:
+          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
+        run: |
+          set -e
+          cat > body.json << 'JSON'
+          {
+            "batchItems": [
+              {"query": "?query=1%20Microsoft%20Way%20Redmond%20WA&countrySet=US"}
+            ]
+          }
+          JSON
+          curl -sS -D headers.txt -o /dev/null \
+            -X POST "https://atlas.microsoft.com/search/address/batch/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}" \
+            -H "Content-Type: application/json" \
+            --data @body.json
+          echo "---- Azure Maps status line (expect 202 Accepted) ----"
+          head -n1 headers.txt || true
+
+      # 6) Run your batch geocoding script
+      - name: Run batch geocoding
+        env:
+          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}   # Set this secret in: Settings → Secrets and variables → Actions
+        run: |
+          python azure_maps_batch_geocode_and_merge.py
+
+      # 7) Upload the updated Excel workbook as a run artifact
+      - name: Upload result workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: geocoded-workbook
+          path: Locations_geocode_ready.xlsx
+
+      # 8) Upload the QA preview CSV (optional helper files)
+      - name: Upload QA preview
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: geocode-results-preview
+          path: geocode_results_preview.csv
+
+      - name: Upload first-batch debug JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-first-batch
+          path: debug_first_batch.json
