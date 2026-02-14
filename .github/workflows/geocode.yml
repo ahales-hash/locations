@@ -1,86 +1,105 @@
 name: Geocode with Azure Maps
 
 on:
-  workflow_dispatch:  # Run manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
   geocode:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Pull your repository files
+      # 0) Checkout
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Install Python 3.11
+      # 1) Python runtime
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3) Install the few packages the script needs
+      # 2) Install deps
       - name: Install dependencies
         run: |
+          set -euxo pipefail
+          python -V
           python -m pip install --upgrade pip
           pip install pandas openpyxl requests
 
-      # 4) Verify both required files are present at the REPO ROOT
-      - name: Verify input files exist
+      # 3) Show repo and file basics (proves step prints)
+      - name: Diagnostics — list repo and show file heads
         run: |
-          echo "Listing repo files:"
+          set -euxo pipefail
+          echo "PWD: $(pwd)"
+          echo "Repo contents:"
           ls -la
-          if [ ! -f "azure_maps_batch_geocode_and_merge.py" ]; then
-            echo "❌ Missing: azure_maps_batch_geocode_and_merge.py at repo root"
-            exit 1
-          fi
-          if [ ! -f "Locations_geocode_ready.xlsx" ]; then
-            echo "❌ Missing: Locations_geocode_ready.xlsx at repo root"
-            exit 1
-          fi
-          echo "✔️ Both files found."
+          echo "------- head azure_maps_batch_geocode_and_merge.py (first 60 lines) -------"
+          head -n 60 azure_maps_batch_geocode_and_merge.py || true
+          echo "------- head Locations_geocode_ready.xlsx (binary) -------"
+          # Can't head a binary nicely; just show file type & size instead
+          file Locations_geocode_ready.xlsx || true
+          stat -c "%n size=%s bytes" Locations_geocode_ready.xlsx || true
+          # Save these outputs for artifact
+          ls -la > repo_ls.txt
+          (head -n 200 azure_maps_batch_geocode_and_merge.py || true) > script_head.txt
+          (echo "file info:"; file Locations_geocode_ready.xlsx || true; stat -c "%n size=%s bytes" Locations_geocode_ready.xlsx || true) > excel_info.txt
 
-      # 5) (Optional) Probe your Azure Maps key BEFORE running the big batch
-      #    Expect 202 Accepted here if the key is valid and the secret is available to the runner.
-      - name: Probe Azure Maps key (sanity test)
-        env:
-          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
-        run: |
-          set -e
-          cat > body.json << 'JSON'
-          {
-            "batchItems": [
-              {"query": "?query=1%20Microsoft%20Way%20Redmond%20WA&countrySet=US"}
-            ]
-          }
-          JSON
-          curl -sS -D headers.txt -o /dev/null \
-            -X POST "https://atlas.microsoft.com/search/address/batch/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}" \
-            -H "Content-Type: application/json" \
-            --data @body.json
-          echo "---- Azure Maps status line (expect 202 Accepted) ----"
-          head -n1 headers.txt || true
-
-      # 6) Run your batch geocoding script (verbose + unbuffered), capture full output to a log
-      - name: Run batch geocoding
-        env:
-          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
-          PYTHONUNBUFFERED: '1'     # ensure Python prints immediately
-        run: |
-          set -euxo pipefail        # be chatty; fail fast; show commands
-          echo "Python version: $(python --version)"
-          echo "Repo contents:"; ls -la
-          echo "----- starting script at $(date -u) -----"
-          python -u azure_maps_batch_geocode_and_merge.py 2>&1 | tee geocode_step_output.log
-          echo "----- script finished at $(date -u) -----"
-
-      # 7) Upload the updated Excel workbook as a run artifact
-      - name: Upload result workbook
+      - name: Upload DIAG files
         uses: actions/upload-artifact@v4
         with:
-          name: geocoded-workbook
-          path: Locations_geocode_ready.xlsx
+          name: diag-files
+          path: |
+            repo_ls.txt
+            script_head.txt
+            excel_info.txt
 
-      # 8) Upload the geocode step log (so we can always review the full Python output)
+      # 4) Verify Python can import deps
+      - name: Diagnostics — Python quick imports
+        run: |
+          set -euxo pipefail
+          python - << 'PY'
+import sys, json
+print("✅ Python is alive:", sys.version)
+import pandas, openpyxl, requests
+print("✅ Imports OK: pandas", pandas.__version__, "openpyxl", openpyxl.__version__)
+PY
+
+      # 5) Probe Azure Maps key with a small SYNC query so we get immediate JSON
+      #    (This is separate from your async batch flow, just to confirm your key is accepted.)
+      - name: Probe Azure Maps key (sync test)
+        env:
+          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
+        run: |
+          set -euxo pipefail
+          curl -sS -D headers.txt -o probe.json \
+            "https://atlas.microsoft.com/search/address/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}&query=1%20Microsoft%20Way%20Redmond%20WA"
+          echo "---- Status line (expect 200) ----"
+          head -n1 headers.txt || true
+          echo "---- Snippet of body ----"
+          head -n 40 probe.json || true
+
+      - name: Upload probe response
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-response
+          path: |
+            headers.txt
+            probe.json
+
+      # 6) Run your batch script with UNBUFFERED output and capture full log
+      - name: Run batch geocoding (unbuffered + tee)
+        env:
+          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -euxo pipefail
+          echo "----- starting python script at $(date -u) -----"
+          echo "Python version: $(python --version)"
+          ls -la
+          # Force unbuffered output with -u; tee to log file so we can upload even if UI stays quiet
+          python -u azure_maps_batch_geocode_and_merge.py 2>&1 | tee geocode_step_output.log
+          echo "----- python script finished at $(date -u) -----"
+
       - name: Upload geocode step log
         if: always()
         uses: actions/upload-artifact@v4
@@ -88,16 +107,22 @@ jobs:
           name: geocode-step-log
           path: geocode_step_output.log
 
-      # 9) (Optional) Upload a quick results CSV if the script produced it
-      - name: Upload QA preview
+      # 7) Upload the updated Excel workbook
+      - name: Upload result workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: geocoded-workbook
+          path: Locations_geocode_ready.xlsx
+
+      # 8) Conditional helpers — only upload if script generated them
+      - name: Upload QA preview (if exists)
         if: ${{ always() && hashFiles('geocode_results_preview.csv') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: geocode-results-preview
           path: geocode_results_preview.csv
 
-      # 10) (Optional) Upload first-batch raw JSON if the script produced it
-      - name: Upload first-batch debug JSON
+      - name: Upload first-batch debug JSON (if exists)
         if: ${{ always() && hashFiles('debug_first_batch.json') != '' }}
         uses: actions/upload-artifact@v4
         with:
