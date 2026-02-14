@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Azure Maps Batch Geocoding for Locations.xlsx
+Azure Maps Batch Geocoding for Locations_geocode_ready.xlsx
 
-Reads the 'Locations' sheet, uses the 'FullAddress' column to submit batch geocoding
+Reads the 'Locations_geocode_ready' sheet, uses the 'FullAddress' column to submit batch geocoding
 jobs to Azure Maps Search Batch API, polls for completion, and writes Lat/Long,
 MatchStatus, and Confidence back into the workbook.
 
