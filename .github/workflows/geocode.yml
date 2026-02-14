@@ -1,0 +1,42 @@
+name: Geocode with Azure Maps
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: geocode-azure-maps
+  cancel-in-progress: false
+
+jobs:
+  geocode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl requests
+
+      - name: Run batch geocoding
+        env:
+          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
+        run: |
+          python azure_maps_batch_geocode_and_merge.py
+
+      - name: Upload result workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: geocoded-workbook
+          path: Locations_geocode_ready.xlsx
