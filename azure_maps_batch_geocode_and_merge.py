@@ -255,7 +255,7 @@ def main():
         all_results.extend(results)
         print(f'Batch {i+1}/{n_batches} completed.')
 
-    # Map results back to rows
+  # Map results back to rows
     geocoded = copy.deepcopy(to_geocode).reset_index(drop=True)
     for idx, r in enumerate(all_results):
         geocoded.at[idx, LAT_COL]    = r['lat']
@@ -263,16 +263,47 @@ def main():
         geocoded.at[idx, STATUS_COL] = r['status']
         geocoded.at[idx, CONF_COL]   = r['confidence']
 
+    # --- Quick QA summary in logs ---
+    total = len(all_results)
+    matched = sum(1 for r in all_results if r['lat'] is not None and r['lon'] is not None)
+    no_match = total - matched
+    print(f"QA Summary: {matched} matched, {no_match} no-match, out of {total}")
+
+    # Merge back into original df using _rowid
     merged = df.merge(
         geocoded[['_rowid', LAT_COL, LON_COL, STATUS_COL, CONF_COL]],
         on='_rowid', how='left', suffixes=('', '_new')
     )
 
+    # Treat empty strings as missing so new values can overwrite them
     for col in [LAT_COL, LON_COL, STATUS_COL, CONF_COL]:
-        merged[col] = merged[col].where(merged[col].notna(), merged[f'{col}_new'])
+        merged[col] = merged[col].replace('', pd.NA)
+
+    # Now fill from *_new where current values are NA or empty-like
+    for col in [LAT_COL, LON_COL, STATUS_COL, CONF_COL]:
+        merged[col] = merged[col].where(
+            ~(merged[col].isna() | (merged[col].astype(str).str.strip() == '')),
+            merged[f'{col}_new']
+        )
         merged.drop(columns=[f'{col}_new'], inplace=True)
 
+    # Drop helper column
     merged.drop(columns=['_rowid'], inplace=True)
+
+    # Optional: coerce Lat/Long to numeric (floats)
+    merged[LAT_COL]  = pd.to_numeric(merged[LAT_COL], errors='coerce')
+    merged[LON_COL]  = pd.to_numeric(merged[LON_COL], errors='coerce')
+
+    # Optional: drop any accidental blank-header columns (e.g., 'Unnamed: 10')
+    merged = merged.loc[:, ~merged.columns.astype(str).str.startswith('Unnamed')]
+
+    # Optional: write a small QA CSV so you can review results easily
+    try:
+        qa = geocoded[[ADDR_COL, LAT_COL, LON_COL, STATUS_COL, CONF_COL]].copy()
+        qa.to_csv('geocode_results_preview.csv', index=False)
+        print("Preview written: geocode_results_preview.csv")
+    except Exception as e:
+        print(f"Skipping preview CSV due to: {e}")
 
     # Backup then write in place
     backup = backup_file(INPUT_FILE)
@@ -282,7 +313,3 @@ def main():
         merged.to_excel(writer, sheet_name=SHEET_NAME, index=False)
 
     print(f'Updated workbook written: {INPUT_FILE}')
-
-
-if __name__ == '__main__':
-    main()
