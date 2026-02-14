@@ -74,54 +74,51 @@ def build_batch_requests(rows):
 
 
 def submit_batch(session, key, reqs):
-    params = {
-        'api-version': API_VERSION,
-        'subscription-key': key
-    }
+    params = {'api-version': API_VERSION, 'subscription-key': key}
     payload = {'batchItems': reqs}
     resp = session.post(BASE_URL, params=params, json=payload, timeout=60)
     resp.raise_for_status()
-    # Azure Maps returns the poll URL in the *Location* header for async batches.
-    # Fall back to Operation-Location just in case.
+    # Prefer Location (Azure Maps async batch docs), fall back to Operation-Location
     op_loc = (
         resp.headers.get('location') or resp.headers.get('Location') or
         resp.headers.get('operation-location') or resp.headers.get('Operation-Location')
     )
     if not op_loc:
-        # Optional: print headers for quick debugging if ever needed
-        # print(f"Status={resp.status_code}, Headers={dict(resp.headers)}")
         raise RuntimeError('Missing Location/Operation-Location header in response.')
     return op_loc
 
 
 def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=1800):
-    # Poll status until succeeded or timeout (default 30 minutes)
     import time
     start = time.time()
     while True:
         params = {'api-version': API_VERSION, 'subscription-key': key}
         r = session.get(op_loc, params=params, timeout=60)
 
-        # While the job is still running, the service may return 202 with no body.
+        # While job is still running, service returns 202 with no body.
         if r.status_code == 202:
-            # Honor server guidance if present; otherwise sleep a small interval.
             retry_after = r.headers.get('Retry-After')
             sleep_s = max(poll_interval, int(retry_after) if retry_after and retry_after.isdigit() else poll_interval)
             print(f"Batch still running (202). Sleeping {sleep_s}s...")
-            time.sleep(min(sleep_s, 15))  # cap each wait to 15s to keep logs responsive
+            time.sleep(min(sleep_s, 15))
             if time.time() - start > timeout_sec:
                 raise TimeoutError('Polling timed out for batch job (still 202).')
             continue
 
+        # Completed or error
         r.raise_for_status()
         data = r.json()
 
-        # Some responses include a 'summary.state' field; others use 'status'
+        # If results are ready, many Azure Maps responses return batchItems directly.
+        if isinstance(data, dict) and 'batchItems' in data:
+            print("Batch results available (batchItems present).")
+            return data
+
+        # Otherwise, try to read a state field if present
         state = (data.get('summary', {}) or {}).get('state') or data.get('status')
         print(f"Batch state: {state}")
 
         if state in ('Running', 'Pending', 'InProgress'):
-            # Still working; sleep and retry
             retry_after = r.headers.get('Retry-After')
             sleep_s = max(poll_interval, int(retry_after) if retry_after and retry_after.isdigit() else poll_interval)
             time.sleep(min(sleep_s, 15))
@@ -135,7 +132,7 @@ def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=1800):
         if state in ('Failed', 'Error'):
             raise RuntimeError(f"Batch failed: {str(data)[:500]}")
 
-        # Fallback: if state is unknown, short sleep and retry
+        # Fallback: unknown/empty state—short sleep and retry
         time.sleep(3)
         if time.time() - start > timeout_sec:
             raise TimeoutError('Polling timed out for batch job (unknown state).')
