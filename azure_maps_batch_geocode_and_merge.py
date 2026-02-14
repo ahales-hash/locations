@@ -29,7 +29,7 @@ from pathlib import Path
 
 INPUT_FILE = 'Locations_geocode_ready.xlsx'
 SHEET_NAME = 'Locations'
-BATCH_SIZE = 500
+BATCH_SIZE = 100
 COUNTRY_SET = 'US'
 API_VERSION = '1.0'
 BASE_URL = 'https://atlas.microsoft.com/search/address/batch/json'
@@ -94,21 +94,51 @@ def submit_batch(session, key, reqs):
     return op_loc
 
 
-def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=300):
+def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=1800):
+    # Poll status until succeeded or timeout (default 30 minutes)
+    import time
     start = time.time()
     while True:
         params = {'api-version': API_VERSION, 'subscription-key': key}
         r = session.get(op_loc, params=params, timeout=60)
+
+        # While the job is still running, the service may return 202 with no body.
+        if r.status_code == 202:
+            # Honor server guidance if present; otherwise sleep a small interval.
+            retry_after = r.headers.get('Retry-After')
+            sleep_s = max(poll_interval, int(retry_after) if retry_after and retry_after.isdigit() else poll_interval)
+            print(f"Batch still running (202). Sleeping {sleep_s}s...")
+            time.sleep(min(sleep_s, 15))  # cap each wait to 15s to keep logs responsive
+            if time.time() - start > timeout_sec:
+                raise TimeoutError('Polling timed out for batch job (still 202).')
+            continue
+
         r.raise_for_status()
         data = r.json()
-        status = data.get('summary', {}).get('state') or data.get('status')
-        if status in ('Succeeded', 'Completed'):
+
+        # Some responses include a 'summary.state' field; others use 'status'
+        state = (data.get('summary', {}) or {}).get('state') or data.get('status')
+        print(f"Batch state: {state}")
+
+        if state in ('Running', 'Pending', 'InProgress'):
+            # Still working; sleep and retry
+            retry_after = r.headers.get('Retry-After')
+            sleep_s = max(poll_interval, int(retry_after) if retry_after and retry_after.isdigit() else poll_interval)
+            time.sleep(min(sleep_s, 15))
+            if time.time() - start > timeout_sec:
+                raise TimeoutError('Polling timed out for batch job.')
+            continue
+
+        if state in ('Succeeded', 'Completed'):
             return data
-        if status in ('Failed', 'Error'):
-            raise RuntimeError(f'Batch failed: {json.dumps(data)[:500]}')
+
+        if state in ('Failed', 'Error'):
+            raise RuntimeError(f"Batch failed: {str(data)[:500]}")
+
+        # Fallback: if state is unknown, short sleep and retry
+        time.sleep(3)
         if time.time() - start > timeout_sec:
-            raise TimeoutError('Polling timed out for batch job.')
-        time.sleep(poll_interval)
+            raise TimeoutError('Polling timed out for batch job (unknown state).')
 
 
 def parse_results(batch_result):
