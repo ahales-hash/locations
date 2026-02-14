@@ -81,9 +81,16 @@ def submit_batch(session, key, reqs):
     payload = {'batchItems': reqs}
     resp = session.post(BASE_URL, params=params, json=payload, timeout=60)
     resp.raise_for_status()
-    op_loc = resp.headers.get('operation-location') or resp.headers.get('Operation-Location')
+    # Azure Maps returns the poll URL in the *Location* header for async batches.
+    # Fall back to Operation-Location just in case.
+    op_loc = (
+        resp.headers.get('location') or resp.headers.get('Location') or
+        resp.headers.get('operation-location') or resp.headers.get('Operation-Location')
+    )
     if not op_loc:
-        raise RuntimeError('Missing operation-location header in response.')
+        # Optional: print headers for quick debugging if ever needed
+        # print(f"Status={resp.status_code}, Headers={dict(resp.headers)}")
+        raise RuntimeError('Missing Location/Operation-Location header in response.')
     return op_loc
 
 
