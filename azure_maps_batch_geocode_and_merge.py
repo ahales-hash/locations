@@ -3,18 +3,21 @@
 Azure Maps Batch Geocoding for Locations.xlsx
 
 Reads the 'Locations' sheet, uses the 'FullAddress' column to submit batch geocoding
-jobs to Azure Maps Search Batch API, polls for completion, and writes Lat/Long,
-MatchStatus, and Confidence back into the workbook.
+jobs to Azure Maps Search Address Batch (async) API, polls for completion, and writes
+Lat/Long, MatchStatus, and Confidence back into the workbook.
 
-Usage:
-  1) Provide AZURE_MAPS_KEY as an environment secret in your GitHub Action
-     (Settings → Secrets and variables → Actions → New repository secret).
-  2) Place this script at the repo root alongside 'Locations_geocode_ready.xlsx'.
-  3) The workflow runs: python azure_maps_batch_geocode_and_merge.py
+Usage (GitHub Actions):
+  1) Store your Azure Maps Primary Key as a repo secret named AZURE_MAPS_KEY.
+  2) Put this script and 'Locations_geocode_ready.xlsx' at the repo root.
+  3) Run the workflow; this script is invoked with:
+       python azure_maps_batch_geocode_and_merge.py
 
 Notes:
-  - BATCH_SIZE default (500) balances throughput and throttling.
-  - Restricts search to countrySet=US to improve precision for your data.
+  - The Azure Maps async batch flow is: POST -> 202 + Location header -> poll the
+    Location URL until results are available (often returned directly as batchItems).
+  - We check both 'Location' and 'Operation-Location' headers for robustness.
+  - We honor 'Retry-After' headers while polling and allow up to 30 minutes.
+  - BATCH_SIZE is 100 by default to reduce throttling and improve reliability.
 """
 
 import os
@@ -27,21 +30,27 @@ import datetime as dt
 import requests
 from pathlib import Path
 
-INPUT_FILE = 'Locations_geocode_ready.xlsx'
-SHEET_NAME = 'Locations'
-BATCH_SIZE = 100
+# -------------------------
+# Configuration constants
+# -------------------------
+INPUT_FILE  = 'Locations_geocode_ready.xlsx'
+SHEET_NAME  = 'Locations'
+BATCH_SIZE  = 100           # submit in smaller async jobs for reliability
 COUNTRY_SET = 'US'
 API_VERSION = '1.0'
-BASE_URL = 'https://atlas.microsoft.com/search/address/batch/json'
+BASE_URL    = 'https://atlas.microsoft.com/search/address/batch/json'
 
 # Columns
 ADDR_COL = 'FullAddress'
-LAT_COL = 'Lat'
-LON_COL = 'Long'
+LAT_COL  = 'Lat'
+LON_COL  = 'Long'
 STATUS_COL = 'MatchStatus'
-CONF_COL = 'Confidence'
+CONF_COL   = 'Confidence'
 
 
+# -------------------------
+# Helpers
+# -------------------------
 def load_key():
     key = os.environ.get('AZURE_MAPS_KEY')
     if not key:
@@ -63,6 +72,7 @@ def load_locations():
 
 
 def build_batch_requests(rows):
+    """Build Azure Maps Search Address batchItems payload."""
     reqs = []
     for _, r in rows.iterrows():
         query = str(r[ADDR_COL]).strip()
@@ -74,11 +84,15 @@ def build_batch_requests(rows):
 
 
 def submit_batch(session, key, reqs):
+    """
+    Submit async batch. Azure Maps returns 202 and the poll URL in the Location header
+    (some services may use Operation-Location; we check both).
+    """
     params = {'api-version': API_VERSION, 'subscription-key': key}
     payload = {'batchItems': reqs}
     resp = session.post(BASE_URL, params=params, json=payload, timeout=60)
     resp.raise_for_status()
-    # Prefer Location (Azure Maps async batch docs), fall back to Operation-Location
+
     op_loc = (
         resp.headers.get('location') or resp.headers.get('Location') or
         resp.headers.get('operation-location') or resp.headers.get('Operation-Location')
@@ -89,13 +103,19 @@ def submit_batch(session, key, reqs):
 
 
 def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=1800):
-    import time
+    """
+    Poll the async batch URL until results are available or timeout.
+    Behavior:
+      - 202 -> still running; sleep (honor Retry-After) then continue
+      - 200 -> if 'batchItems' in body, results are ready (return);
+               else check 'summary.state' or 'status' and keep polling for running states
+    """
     start = time.time()
     while True:
         params = {'api-version': API_VERSION, 'subscription-key': key}
         r = session.get(op_loc, params=params, timeout=60)
 
-        # While job is still running, service returns 202 with no body.
+        # Still running; service returns 202 with (often) no body.
         if r.status_code == 202:
             retry_after = r.headers.get('Retry-After')
             sleep_s = max(poll_interval, int(retry_after) if retry_after and retry_after.isdigit() else poll_interval)
@@ -107,14 +127,22 @@ def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=1800):
 
         # Completed or error
         r.raise_for_status()
-        data = r.json()
 
-        # If results are ready, many Azure Maps responses return batchItems directly.
+        # Attempt to parse JSON; if not JSON, short sleep and retry
+        try:
+            data = r.json()
+        except Exception:
+            time.sleep(3)
+            if time.time() - start > timeout_sec:
+                raise TimeoutError('Polling timed out for batch job (non-JSON response).')
+            continue
+
+        # If results are ready, many responses return 'batchItems' directly.
         if isinstance(data, dict) and 'batchItems' in data:
             print("Batch results available (batchItems present).")
             return data
 
-        # Otherwise, try to read a state field if present
+        # Otherwise check state if provided
         state = (data.get('summary', {}) or {}).get('state') or data.get('status')
         print(f"Batch state: {state}")
 
@@ -130,16 +158,21 @@ def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=1800):
             return data
 
         if state in ('Failed', 'Error'):
+            # Truncate to avoid massive logs
             raise RuntimeError(f"Batch failed: {str(data)[:500]}")
 
-        # Fallback: unknown/empty state—short sleep and retry
+        # Unknown/empty state—short sleep and retry
         time.sleep(3)
         if time.time() - start > timeout_sec:
             raise TimeoutError('Polling timed out for batch job (unknown state).')
 
 
 def parse_results(batch_result):
-    results = []
+    """
+    Extract best match per request from Azure Maps response.
+    Each item has 'response' with 'results' array -> take [0] for best.
+    """
+    out = []
     items = batch_result.get('batchItems') or []
     for item in items:
         resp = item.get('response') or {}
@@ -147,14 +180,15 @@ def parse_results(batch_result):
         if reslist:
             best = reslist[0]
             pos = best.get('position', {})
-            lat = pos.get('lat')
-            lon = pos.get('lon')
-            score = best.get('score')
-            match = best.get('type') or best.get('entityType') or 'Matched'
-            results.append({'lat': lat, 'lon': lon, 'status': match, 'confidence': score})
+            out.append({
+                'lat': pos.get('lat'),
+                'lon': pos.get('lon'),
+                'status': best.get('type') or best.get('entityType') or 'Matched',
+                'confidence': best.get('score')
+            })
         else:
-            results.append({'lat': None, 'lon': None, 'status': 'No Match', 'confidence': None})
-    return results
+            out.append({'lat': None, 'lon': None, 'status': 'No Match', 'confidence': None})
+    return out
 
 
 def backup_file(path):
@@ -165,6 +199,9 @@ def backup_file(path):
     return backup
 
 
+# -------------------------
+# Main flow
+# -------------------------
 def main():
     key = load_key()
     df, to_geocode = load_locations()
@@ -181,24 +218,29 @@ def main():
     all_results = []
     for i in range(n_batches):
         start = i * BATCH_SIZE
-        end = min((i + 1) * BATCH_SIZE, n)
+        end   = min((i + 1) * BATCH_SIZE, n)
         chunk = to_geocode.iloc[start:end]
+
         reqs = build_batch_requests(chunk)
         op_loc = submit_batch(session, key, reqs)
-        print(f'Batch {i + 1}/{n_batches} submitted. Polling...')
+        print(f'Batch {i+1}/{n_batches} submitted. Polling...')
+
         batch_json = poll_batch(session, key, op_loc)
         results = parse_results(batch_json)
+
         if len(results) != len(chunk):
             raise RuntimeError('Result length mismatch for batch.')
-        all_results.extend(results)
-        print(f'Batch {i + 1}/{n_batches} completed.')
 
+        all_results.extend(results)
+        print(f'Batch {i+1}/{n_batches} completed.')
+
+    # Map results back to rows
     geocoded = copy.deepcopy(to_geocode).reset_index(drop=True)
     for idx, r in enumerate(all_results):
-        geocoded.at[idx, LAT_COL] = r['lat']
-        geocoded.at[idx, LON_COL] = r['lon']
+        geocoded.at[idx, LAT_COL]    = r['lat']
+        geocoded.at[idx, LON_COL]    = r['lon']
         geocoded.at[idx, STATUS_COL] = r['status']
-        geocoded.at[idx, CONF_COL] = r['confidence']
+        geocoded.at[idx, CONF_COL]   = r['confidence']
 
     merged = df.merge(
         geocoded[['_rowid', LAT_COL, LON_COL, STATUS_COL, CONF_COL]],
@@ -211,6 +253,7 @@ def main():
 
     merged.drop(columns=['_rowid'], inplace=True)
 
+    # Backup then write in place
     backup = backup_file(INPUT_FILE)
     print(f'Backup written: {backup}')
 
