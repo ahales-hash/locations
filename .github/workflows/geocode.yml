@@ -39,8 +39,8 @@ jobs:
           fi
           echo "✔️ Both files found."
 
-      # 5) Probe your Azure Maps key BEFORE running the big batch
-      #    (Expect 202 Accepted here if the key is valid and the secret is available to the runner.)
+      # 5) (Optional) Probe your Azure Maps key BEFORE running the big batch
+      #    Expect 202 Accepted here if the key is valid and the secret is available to the runner.
       - name: Probe Azure Maps key (sanity test)
         env:
           AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
@@ -60,12 +60,18 @@ jobs:
           echo "---- Azure Maps status line (expect 202 Accepted) ----"
           head -n1 headers.txt || true
 
-      # 6) Run your batch geocoding script
+      # 6) Run your batch geocoding script (verbose + unbuffered), capture full output to a log
       - name: Run batch geocoding
         env:
-          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}   # Set this secret in: Settings → Secrets and variables → Actions
+          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
+          PYTHONUNBUFFERED: '1'     # ensure Python prints immediately
         run: |
-          python azure_maps_batch_geocode_and_merge.py
+          set -euxo pipefail        # be chatty; fail fast; show commands
+          echo "Python version: $(python --version)"
+          echo "Repo contents:"; ls -la
+          echo "----- starting script at $(date -u) -----"
+          python -u azure_maps_batch_geocode_and_merge.py 2>&1 | tee geocode_step_output.log
+          echo "----- script finished at $(date -u) -----"
 
       # 7) Upload the updated Excel workbook as a run artifact
       - name: Upload result workbook
@@ -74,16 +80,25 @@ jobs:
           name: geocoded-workbook
           path: Locations_geocode_ready.xlsx
 
-      # 8) (Optional helpers) Upload a quick results CSV and a debug JSON
-      - name: Upload QA preview
+      # 8) Upload the geocode step log (so we can always review the full Python output)
+      - name: Upload geocode step log
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: geocode-step-log
+          path: geocode_step_output.log
+
+      # 9) (Optional) Upload a quick results CSV if the script produced it
+      - name: Upload QA preview
+        if: ${{ always() && hashFiles('geocode_results_preview.csv') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: geocode-results-preview
           path: geocode_results_preview.csv
 
+      # 10) (Optional) Upload first-batch raw JSON if the script produced it
       - name: Upload first-batch debug JSON
-        if: always()
+        if: ${{ always() && hashFiles('debug_first_batch.json') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: debug-first-batch
