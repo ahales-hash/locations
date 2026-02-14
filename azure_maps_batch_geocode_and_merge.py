@@ -73,16 +73,22 @@ def load_locations():
     return df, to_geocode
 
 
+from urllib.parse import quote_plus
+
 def build_batch_requests(rows):
-    """Build Azure Maps Search Address batchItems payload."""
-    reqs = []
+    """
+    Build Azure Maps Search Address batchItems payload as *partial URLs*, e.g.:
+      {"query": "?query=1%20Microsoft%20Way%20Redmond%20WA&countrySet=US"}
+    This matches the REST docs for Search Address Batch.
+    """
+    items = []
     for _, r in rows.iterrows():
-        query = str(r[ADDR_COL]).strip()
-        reqs.append({
-            'query': query,
-            'countrySet': COUNTRY_SET
+        raw = str(r[ADDR_COL]).strip()
+        q = quote_plus(raw)  # URL-encode the address
+        items.append({
+            "query": f"?query={q}&countrySet={COUNTRY_SET}"
         })
-    return reqs
+    return items
 
 
 def submit_batch(session, key, reqs):
