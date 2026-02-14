@@ -42,17 +42,23 @@ jobs:
       # 5) (Optional but helpful) Probe your Azure Maps key BEFORE running the big batch
       #    Expect 202 Accepted here if the key is valid and the secret is available to the runner.
       - name: Probe Azure Maps key (sanity test)
-        env:
-          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
-        run: |
-          set -e
-          echo '{"batchItems":[{"query":"1 Microsoft Way, Redmond, WA","countrySet":"US"}]}' > body.json
-          curl -sS -D headers.txt -o /dev/null \
-            -X POST "https://atlas.microsoft.com/search/address/batch/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}" \
-            -H "Content-Type: application/json" \
-            --data @body.json
-          echo "---- Azure Maps status line (expect 202 Accepted) ----"
-          head -n1 headers.txt || true
+  env:
+    AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
+  run: |
+    set -e
+    # Use *partial URL* items as the docs specify:
+    cat > body.json << 'JSON'
+    {
+      "batchItems": [
+        {"query": "?query=1%20Microsoft%20Way%20Redmond%20WA&countrySet=US"}
+      ]
+    }
+    JSON
+    curl -sS -D headers.txt -o body_out.json \
+      -X POST "https://atlas.microsoft.com/search/address/batch/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}" \
+      -H "Content-Type: application/json" --data @body.json
+    echo "---- Azure Maps status line (expect 202 Accepted) ----"
+    head -n1 headers.txt || true
 
       # 6) Run your batch geocoding script
       - name: Run batch geocoding
