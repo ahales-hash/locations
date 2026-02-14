@@ -1,298 +1,190 @@
-# Azure Maps Search REST client library for JavaScript
+#!/usr/bin/env python3
+"""
+Azure Maps Batch Geocoding for Locations.xlsx
 
-Azure Maps Search Client
+Reads the 'Locations' sheet, uses the 'FullAddress' column to submit batch geocoding
+jobs to Azure Maps Search Batch API, polls for completion, and writes Lat/Long,
+MatchStatus, and Confidence back into the workbook.
 
-\*\*If you are not familiar with our REST client, please spend 5 minutes to take a look at our [REST client docs](https://github.com/Azure/azure-sdk-for-js/blob/main/documentation/rest-clients.md) to use this library, the REST client provides a light-weighted & developer friendly way to call azure rest api
+Usage:
+  1) Provide AZURE_MAPS_KEY as an environment secret in your GitHub Action
+     (Settings → Secrets and variables → Actions → New repository secret).
+  2) Place this script at the repo root alongside 'Locations_geocode_ready.xlsx'.
+  3) The workflow runs: python azure_maps_batch_geocode_and_merge.py
 
-Key links:
+Notes:
+  - BATCH_SIZE default (500) balances throughput and throttling.
+  - Restricts search to countrySet=US to improve precision for your data.
+"""
 
-- [Source code](https://github.com/Azure/azure-sdk-for-js/tree/main/sdk/maps/maps-search-rest)
-- [Package (NPM)](https://www.npmjs.com/package/@azure-rest/maps-search)
-- [API reference documentation](https://learn.microsoft.com/javascript/api/@azure-rest/maps-search?view=azure-node-preview)
-- [Samples](https://github.com/Azure/azure-sdk-for-js/tree/main/sdk/maps/maps-search-rest/samples)
-- [Product Information](https://learn.microsoft.com/rest/api/maps/search)
+import os
+import time
+import json
+import math
+import copy
+import pandas as pd
+import datetime as dt
+import requests
+from pathlib import Path
 
-| Package Version | Service Version |
-| --------------- | --------------- |
-| ^1.0.0          | V1              |
-| ^2.0.0          | V2              |
+INPUT_FILE = 'Locations_geocode_ready.xlsx'
+SHEET_NAME = 'Locations'
+BATCH_SIZE = 500
+COUNTRY_SET = 'US'
+API_VERSION = '1.0'
+BASE_URL = 'https://atlas.microsoft.com/search/address/batch/json'
 
-## Getting started
+# Columns
+ADDR_COL = 'FullAddress'
+LAT_COL = 'Lat'
+LON_COL = 'Long'
+STATUS_COL = 'MatchStatus'
+CONF_COL = 'Confidence'
 
-### Currently supported environments
 
-- [LTS versions of Node.js](https://github.com/nodejs/release#release-schedule)
-- Latest versions of Safari, Chrome, Edge and Firefox.
+def load_key():
+    key = os.environ.get('AZURE_MAPS_KEY')
+    if not key:
+        raise RuntimeError('AZURE_MAPS_KEY environment variable is not set.')
+    return key
 
-### Prerequisites
 
-- You must have an [Azure subscription](https://azure.microsoft.com/free/) to use this package.
-- An [Azure Maps account](https://learn.microsoft.com/azure/azure-maps/how-to-manage-account-keys). You can create the resource via the [Azure Portal](https://portal.azure.com), the [Azure PowerShell](https://learn.microsoft.com/powershell/module/az.maps/new-azmapsaccount), or the [Azure CLI](https://learn.microsoft.com/cli/azure).
+def load_locations():
+    df = pd.read_excel(INPUT_FILE, sheet_name=SHEET_NAME, engine='openpyxl')
+    if ADDR_COL not in df.columns:
+        raise ValueError(f"Missing '{ADDR_COL}' column in sheet '{SHEET_NAME}'.")
+    # Ensure result columns exist
+    for col in [LAT_COL, LON_COL, STATUS_COL, CONF_COL]:
+        if col not in df.columns:
+            df[col] = ''
+    df['_rowid'] = range(len(df))
+    to_geocode = df[df[ADDR_COL].astype(str).str.strip() != ''].copy()
+    return df, to_geocode
 
-If you use Azure CLI, replace `<resource-group-name>` and `<map-account-name>` of your choice, and select a proper [pricing tier](https://learn.microsoft.com/azure/azure-maps/choose-pricing-tier) based on your needs via the `<sku-name>` parameter. Please refer to [this page](https://learn.microsoft.com/cli/azure/maps/account?view=azure-cli-latest#az_maps_account_create) for more details.
 
-```bash
-az maps account create --resource-group <resource-group-name> --name <map-account-name> --sku <sku-name>
-```
+def build_batch_requests(rows):
+    reqs = []
+    for _, r in rows.iterrows():
+        query = str(r[ADDR_COL]).strip()
+        reqs.append({
+            'query': query,
+            'countrySet': COUNTRY_SET
+        })
+    return reqs
 
-### Install the `@azure-rest/maps-search` package
 
-Install the Azure Maps Search REST client library for JavaScript with `npm`:
-
-```bash
-npm install @azure-rest/maps-search
-```
-
-### Create and authenticate a `MapsSearchClient`
-
-To create a client object to access the Azure Maps Search APIs, you will need a `credential` object. The Azure Maps Search client can use a Microsoft Entra ID credential or an Azure Key credential to authenticate.
-
-#### Using a Microsoft Entra ID Credential
-
-You can authenticate with Microsoft Entra ID using the [Azure Identity library](https://github.com/Azure/azure-sdk-for-js/tree/master/sdk/identity/identity). To use the [DefaultAzureCredential](https://github.com/Azure/azure-sdk-for-js/tree/master/sdk/identity/identity#defaultazurecredential) provider shown below, or other credential providers provided with the Azure SDK, please install the `@azure/identity` package:
-
-```bash
-npm install @azure/identity
-```
-
-You will also need to register a new Microsoft Entra ID application and grant access to Azure Maps by assigning the suitable role to your service principal. Please refer to the [Manage authentication](https://learn.microsoft.com/azure/azure-maps/how-to-manage-authentication) page.
-
-Set the values of the client ID, tenant ID, and client secret of the Microsoft Entra ID application as environment variables: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`.
-
-You will also need to specify the Azure Maps resource you intend to use by specifying the `clientId` in the client options.
-The Azure Maps resource client id can be found in the Authentication sections in the Azure Maps resource. Please refer to the [documentation](https://learn.microsoft.com/azure/azure-maps/how-to-manage-authentication#view-authentication-details) on how to find it.
-
-```ts snippet:ReadmeSampleCreateClient_TokenCredential
-import { DefaultAzureCredential } from "@azure/identity";
-import MapsSearch from "@azure-rest/maps-search";
-
-const credential = new DefaultAzureCredential();
-const client = MapsSearch(credential, "<maps-account-client-id>");
-```
-
-#### Using a Subscription Key Credential
-
-You can authenticate with your Azure Maps Subscription Key.
-
-```ts snippet:ReadmeSampleCreateClient_SubscriptionKey
-import { AzureKeyCredential } from "@azure/core-auth";
-import MapsSearch from "@azure-rest/maps-search";
-
-const credential = new AzureKeyCredential("<subscription-key>");
-const client = MapsSearch(credential);
-```
-
-#### Using a Shared Access Signature (SAS) Token Credential
-
-Shared access signature (SAS) tokens are authentication tokens created using the JSON Web token (JWT) format and are cryptographically signed to prove authentication for an application to the Azure Maps REST API.
-
-You can get the SAS token using [`AzureMapsManagementClient.accounts.listSas`](https://learn.microsoft.com/javascript/api/%40azure/arm-maps/accounts?view=azure-node-latest#@azure-arm-maps-accounts-listsas) from ["@azure/arm-maps"](https://www.npmjs.com/package/@azure/arm-maps) package. Please follow the section [Create and authenticate a `AzureMapsManagementClient`](https://github.com/Azure/azure-sdk-for-js/tree/main/sdk/maps/arm-maps#create-and-authenticate-a-azuremapsmanagementclient) to setup first.
-
-Second, follow [Managed identities for Azure Maps](https://techcommunity.microsoft.com/t5/azure-maps-blog/managed-identities-for-azure-maps/ba-p/3666312) to create a managed identity for your Azure Maps account. Copy the principal ID (object ID) of the managed identity.
-
-Third, you will need to install["@azure/core-auth"](https://www.npmjs.com/package/@azure/core-auth)package to use `AzureSASCredential`:
-
-```bash
-npm install @azure/core-auth
-```
-
-Finally, you can use the SAS token to authenticate the client:
-
-```ts snippet:ReadmeSampleCreateClient_SAS
-import { DefaultAzureCredential } from "@azure/identity";
-import { AzureMapsManagementClient } from "@azure/arm-maps";
-import { AzureSASCredential } from "@azure/core-auth";
-import MapsSearch from "@azure-rest/maps-search";
-
-const subscriptionId = "<subscription ID of the map account>";
-const resourceGroupName = "<resource group name of the map account>";
-const accountName = "<name of the map account>";
-const mapsAccountSasParameters = {
-  start: "<start time in ISO format>", // e.g. "2023-11-24T03:51:53.161Z"
-  expiry: "<expiry time in ISO format>", // maximum value to start + 1 day
-  maxRatePerSecond: 500,
-  principalId: "<principle ID (object ID) of the managed identity>",
-  signingKey: "primaryKey",
-};
-
-const credential = new DefaultAzureCredential();
-const managementClient = new AzureMapsManagementClient(credential, subscriptionId);
-const { accountSasToken } = await managementClient.accounts.listSas(
-  resourceGroupName,
-  accountName,
-  mapsAccountSasParameters,
-);
-
-if (accountSasToken === undefined) {
-  throw new Error("No accountSasToken was found for the Maps Account.");
-}
-
-const sasCredential = new AzureSASCredential(accountSasToken);
-const client = MapsSearch(sasCredential);
-```
-
-## Key concepts
-
-### MapsSearchClient
-
-`MapsSearchClient` is the primary interface for developers using the Azure Maps Search client library. Explore the methods on this client object to understand the different features of the Azure Maps Search service that you can access.
-
-## Examples
-
-The following sections provide several code snippets covering some of the most common Azure Maps Search tasks, including:
-
-- [Request latitude and longitude coordinates for an address](#request-latitude-and-longitude-coordinates-for-an-address)
-- [Make a Reverse Address Search to translate coordinate location to street address](#make-a-reverse-address-search-to-translate-coordinate-location-to-street-address)
-
-### Request latitude and longitude coordinates for an address
-
-You can use an authenticated client to convert an address into latitude and longitude coordinates. This process is also called geocoding. In addition to returning the coordinates, the response will also return detailed address properties such as postal code, admin districts, and country/region information.
-
-```ts snippet:ReadmeSampleGeocode
-import { DefaultAzureCredential } from "@azure/identity";
-import MapsSearch, { isUnexpected } from "@azure-rest/maps-search";
-
-const credential = new DefaultAzureCredential();
-const client = MapsSearch(credential, "<maps-account-client-id>");
-
-/** Make a request to the geocoding API */
-const response = await client
-  .path("/geocode")
-  .get({ queryParameters: { query: "400 Broad, Seattle" } });
-// @ts-preserve-whitespaces
-/** Handle error response */
-if (isUnexpected(response)) {
-  throw response.body.error;
-}
-
-/** Log the response body. */
-if (!response.body.features) {
-  console.log(`No coordinates found for the address.`);
-} else {
-  console.log(`The followings are the possible coordinates of the address:`);
-  for (const result of response.body.features) {
-    const [lon, lat] = result.geometry.coordinates;
-    console.log(`Latitude: ${lat}, Longitude ${lon}`);
-    console.log("Postal code: ", result.properties?.address?.postalCode);
-    console.log("Admin districts: ", result.properties?.address?.adminDistricts?.join(", "));
-    console.log("Country region: ", result.properties?.address?.countryRegion);
-  }
-}
-```
-
-### Make a Reverse Address Search to translate coordinate location to street address
-
-You can translate coordinates into human readable street addresses. This process is also called reverse geocoding.
-This is often used for applications that consume GPS feeds and want to discover addresses at specific coordinate points.
-
-```ts snippet:ReadmeSampleReverseGeocode
-import { DefaultAzureCredential } from "@azure/identity";
-import MapsSearch, { isUnexpected } from "@azure-rest/maps-search";
-
-const credential = new DefaultAzureCredential();
-const client = MapsSearch(credential, "<maps-account-client-id>");
-
-/** Make the request. */
-const response = await client.path("/reverseGeocode").get({
-  queryParameters: { coordinates: [-121.89, 37.337] }, // [longitude, latitude],
-});
-
-/** Handle error response. */
-if (isUnexpected(response)) {
-  throw response.body.error;
-}
-
-if (!response.body.features || response.body.features.length === 0) {
-  console.log("No results found.");
-} else {
-  /** Log the response body. */
-  for (const feature of response.body.features) {
-    if (feature.properties?.address?.formattedAddress) {
-      console.log(feature.properties.address.formattedAddress);
-    } else {
-      console.log("No address found.");
+def submit_batch(session, key, reqs):
+    params = {
+        'api-version': API_VERSION,
+        'subscription-key': key
     }
-  }
-}
-```
+    payload = {'batchItems': reqs}
+    resp = session.post(BASE_URL, params=params, json=payload, timeout=60)
+    resp.raise_for_status()
+    op_loc = resp.headers.get('operation-location') or resp.headers.get('Operation-Location')
+    if not op_loc:
+        raise RuntimeError('Missing operation-location header in response.')
+    return op_loc
 
-## Use V1 SDK
 
-We'll bring all the V1 features to V2 in the near future, but if you want to use V1 SDK, you can install the packages as below:
+def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=300):
+    start = time.time()
+    while True:
+        params = {'api-version': API_VERSION, 'subscription-key': key}
+        r = session.get(op_loc, params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        status = data.get('summary', {}).get('state') or data.get('status')
+        if status in ('Succeeded', 'Completed'):
+            return data
+        if status in ('Failed', 'Error'):
+            raise RuntimeError(f'Batch failed: {json.dumps(data)[:500]}')
+        if time.time() - start > timeout_sec:
+            raise TimeoutError('Polling timed out for batch job.')
+        time.sleep(poll_interval)
 
-```bash
-npm install @azure-rest/map-search-v1@npm:@azure-rest/map-search@^1.0.0
-npm install @azure-rest/map-search-v2@npm:@azure-rest/map-search@^2.0.0
-```
 
-Then, you can import the two packages:
+def parse_results(batch_result):
+    results = []
+    items = batch_result.get('batchItems') or []
+    for item in items:
+        resp = item.get('response') or {}
+        reslist = resp.get('results') or []
+        if reslist:
+            best = reslist[0]
+            pos = best.get('position', {})
+            lat = pos.get('lat')
+            lon = pos.get('lon')
+            score = best.get('score')
+            match = best.get('type') or best.get('entityType') or 'Matched'
+            results.append({'lat': lat, 'lon': lon, 'status': match, 'confidence': score})
+        else:
+            results.append({'lat': None, 'lon': None, 'status': 'No Match', 'confidence': None})
+    return results
 
-```ts snippet:ignore
-import MapsSearchV1 from "@azure-rest/map-search-v1";
-import MapsSearchV2 from "@azure-rest/map-search-v2";
-```
 
-In the following example, we want to accept an address and search POIs around it. We'll use V2 SDK to get the coordinate of the address(/geocode), and use V1 SDK to search POIs around it(/search/nearby).
+def backup_file(path):
+    p = Path(path)
+    ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup = p.with_name(p.stem + f'.backup_{ts}' + p.suffix)
+    backup.write_bytes(p.read_bytes())
+    return backup
 
-```ts snippet:ignore
-import MapsSearchV1, { isUnexpected: isUnexpectedV1 } from "@azure-rest/map-search-v1";
-import MapsSearchV2, { isUnexpected: isUnexpectedV2 } from "@azure-rest/map-search-v2";
-import { AzureKeyCredential } from "@azure/core-auth";
 
-/** Initialize the MapsSearchClient */
-const clientV1 = MapsSearchV1(new AzureKeyCredential("<subscription-key>"));
-const clientV2 = MapsSearchV2(new AzureKeyCredential("<subscription-key>"));
+def main():
+    key = load_key()
+    df, to_geocode = load_locations()
+    if to_geocode.empty:
+        print('No addresses to geocode.')
+        return
 
-async function searchNearby(address) {
-  /** Make a request to the geocoding API */
-  const geocodeResponse = await clientV2
-    .path("/geocode")
-    .get({ queryParameters: { query: address } });
+    session = requests.Session()
 
-  /** Handle error response */
-  if (isUnexpectedV2(geocodeResponse)) {
-    throw geocodeResponse.body.error;
-  }
+    n = len(to_geocode)
+    n_batches = math.ceil(n / BATCH_SIZE)
+    print(f'Submitting {n} addresses in {n_batches} batch(es)...')
 
-  const [lon, lat] = geocodeResponse.body.features[0].geometry.coordinates;
+    all_results = []
+    for i in range(n_batches):
+        start = i * BATCH_SIZE
+        end = min((i + 1) * BATCH_SIZE, n)
+        chunk = to_geocode.iloc[start:end]
+        reqs = build_batch_requests(chunk)
+        op_loc = submit_batch(session, key, reqs)
+        print(f'Batch {i + 1}/{n_batches} submitted. Polling...')
+        batch_json = poll_batch(session, key, op_loc)
+        results = parse_results(batch_json)
+        if len(results) != len(chunk):
+            raise RuntimeError('Result length mismatch for batch.')
+        all_results.extend(results)
+        print(f'Batch {i + 1}/{n_batches} completed.')
 
-  /** Make a request to the search nearby API */
-  const nearByResponse = await clientV1.path("/search/nearby/{format}", "json").get({
-    queryParameters: { lat, lon },
-  });
-  /** Handle error response */
-  if (isUnexpectedV1(nearByResponse)) {
-    throw nearByResponse.body.error;
-  }
-  /** Log response body */
-  for (const results of nearByResponse.body.results) {
-    console.log(
-      `${result.poi ? result.poi.name + ":" : ""} ${result.address.freeformAddress}. (${
-        result.position.lat
-      }, ${result.position.lon})\n`,
-    );
-  }
-}
+    geocoded = copy.deepcopy(to_geocode).reset_index(drop=True)
+    for idx, r in enumerate(all_results):
+        geocoded.at[idx, LAT_COL] = r['lat']
+        geocoded.at[idx, LON_COL] = r['lon']
+        geocoded.at[idx, STATUS_COL] = r['status']
+        geocoded.at[idx, CONF_COL] = r['confidence']
 
-async function main() {
-  searchNearBy("15127 NE 24th Street, Redmond, WA 98052");
-}
+    merged = df.merge(
+        geocoded[['_rowid', LAT_COL, LON_COL, STATUS_COL, CONF_COL]],
+        on='_rowid', how='left', suffixes=('', '_new')
+    )
 
-main().catch((err) => {
-  console.log(err);
-});
-```
+    for col in [LAT_COL, LON_COL, STATUS_COL, CONF_COL]:
+        merged[col] = merged[col].where(merged[col].notna(), merged[f'{col}_new'])
+        merged.drop(columns=[f'{col}_new'], inplace=True)
 
-## Troubleshooting
+    merged.drop(columns=['_rowid'], inplace=True)
 
-### Logging
+    backup = backup_file(INPUT_FILE)
+    print(f'Backup written: {backup}')
 
-Enabling logging may help uncover useful information about failures. In order to see a log of HTTP requests and responses, set the `AZURE_LOG_LEVEL` environment variable to `info`. Alternatively, logging can be enabled at runtime by calling `setLogLevel` in the `@azure/logger`:
+    with pd.ExcelWriter(INPUT_FILE, engine='openpyxl', mode='w') as writer:
+        merged.to_excel(writer, sheet_name=SHEET_NAME, index=False)
 
-```ts snippet:SetLogLevel
-import { setLogLevel } from "@azure/logger";
+    print(f'Updated workbook written: {INPUT_FILE}')
 
-setLogLevel("info");
-```
 
-For more detailed instructions on how to enable logs, you can look at the [@azure/logger package docs](https://github.com/Azure/azure-sdk-for-js/tree/main/sdk/core/logger).
+if __name__ == '__main__':
+    main()
