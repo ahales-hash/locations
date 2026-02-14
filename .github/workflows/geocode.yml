@@ -39,7 +39,8 @@ jobs:
           fi
           echo "✔️ Both files found."
 
-      # 5) (Optional but helpful) Probe your Azure Maps key BEFORE running the big batch
+      # 5) Probe your Azure Maps key BEFORE running the big batch
+      #    (Expect 202 Accepted here if the key is valid and the secret is available to the runner.)
       - name: Probe Azure Maps key (sanity test)
         env:
           AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
@@ -73,7 +74,7 @@ jobs:
           name: geocoded-workbook
           path: Locations_geocode_ready.xlsx
 
-      # 8) Upload the QA preview CSV (optional helper files)
+      # 8) (Optional helpers) Upload a quick results CSV and a debug JSON
       - name: Upload QA preview
         if: always()
         uses: actions/upload-artifact@v4
