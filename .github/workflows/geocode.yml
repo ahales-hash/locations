@@ -39,7 +39,8 @@ jobs:
           fi
           echo "✔️ Both files found."
 
-      # 5) (Optional) Probe your Azure Maps key BEFORE running the big batch
+      # 5) (Optional but helpful) Probe your Azure Maps key BEFORE running the big batch
+      #    Expect 202 Accepted here if the key is valid and the secret is available to the runner.
       - name: Probe Azure Maps key (sanity test)
         env:
           AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
@@ -56,13 +57,29 @@ jobs:
       # 6) Run your batch geocoding script
       - name: Run batch geocoding
         env:
-          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
+          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}   # Set this secret in: Settings → Secrets and variables → Actions
         run: |
           python azure_maps_batch_geocode_and_merge.py
 
-      # 7) Upload the updated workbook as a run artifact
+      # 7) Upload the updated Excel workbook as a run artifact
       - name: Upload result workbook
         uses: actions/upload-artifact@v4
         with:
           name: geocoded-workbook
           path: Locations_geocode_ready.xlsx
+
+      # 8) Upload the QA preview CSV (so you can quickly confirm Lat/Long values were parsed)
+      - name: Upload QA preview
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: geocode-results-preview
+          path: geocode_results_preview.csv
+
+      # 9) Upload the first-batch raw JSON (helpful if we need to inspect the service response)
+      - name: Upload first-batch debug JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-first-batch
+          path: debug_first_batch.json
