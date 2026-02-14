@@ -58,13 +58,13 @@ print("PY: imports OK, pandas", pd.__version__)
 xlf = "Locations_geocode_ready.xlsx"
 print("PY: loading workbook:", xlf)
 df = pd.read_excel(xlf, sheet_name="Locations", engine="openpyxl")
-cols = [c.strip() for c in df.columns]
-df.columns = cols
+df.columns = [c.strip() for c in df.columns]
 
-# Ensure columns
+# Ensure required columns
 for c in ("Address","City","State","Zip"):
     if c not in df.columns:
         print("PY: ERROR missing column:", c)
+        open("py_dbg.txt","w").write(f"Missing column: {c}\n")
         sys.exit(1)
 
 # Build FullAddress if missing
@@ -88,13 +88,7 @@ for c in ("Lat","Long"):
         df[c] = ""
 
 print("PY: row count:", len(df))
-addr = None
-for v in df["FullAddress"]:
-    v = str(v).strip()
-    if v:
-        addr = v
-        break
-
+addr = next((str(v).strip() for v in df["FullAddress"] if str(v).strip()), None)
 if not addr:
     print("PY: no non-empty FullAddress found")
     open("py_dbg.txt","w").write("No address found in FullAddress\n")
