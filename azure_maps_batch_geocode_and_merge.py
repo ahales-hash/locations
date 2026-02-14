@@ -255,7 +255,7 @@ def main():
         all_results.extend(results)
         print(f'Batch {i+1}/{n_batches} completed.')
 
-  # Map results back to rows
+# Map results back to rows
     geocoded = copy.deepcopy(to_geocode).reset_index(drop=True)
     for idx, r in enumerate(all_results):
         geocoded.at[idx, LAT_COL]    = r['lat']
@@ -263,11 +263,20 @@ def main():
         geocoded.at[idx, STATUS_COL] = r['status']
         geocoded.at[idx, CONF_COL]   = r['confidence']
 
-    # --- Quick QA summary in logs ---
+    # --- QA summary in logs ---
     total = len(all_results)
     matched = sum(1 for r in all_results if r['lat'] is not None and r['lon'] is not None)
     no_match = total - matched
     print(f"QA Summary: {matched} matched, {no_match} no-match, out of {total}")
+
+    # --- Optional: save first batch raw JSON for debugging ---
+    try:
+        # Save the last 'batch_json' we saw (the loop variable)
+        with open('debug_first_batch.json', 'w') as f:
+            json.dump(batch_json, f)  # provided by the loop above
+        print("Saved debug_first_batch.json")
+    except Exception as e:
+        print(f"Skipping debug JSON: {e}")
 
     # Merge back into original df using _rowid
     merged = df.merge(
@@ -290,14 +299,14 @@ def main():
     # Drop helper column
     merged.drop(columns=['_rowid'], inplace=True)
 
-    # Optional: coerce Lat/Long to numeric (floats)
-    merged[LAT_COL]  = pd.to_numeric(merged[LAT_COL], errors='coerce')
-    merged[LON_COL]  = pd.to_numeric(merged[LON_COL], errors='coerce')
+    # Coerce Lat/Long to numeric (floats)
+    merged[LAT_COL] = pd.to_numeric(merged[LAT_COL], errors='coerce')
+    merged[LON_COL] = pd.to_numeric(merged[LON_COL], errors='coerce')
 
-    # Optional: drop any accidental blank-header columns (e.g., 'Unnamed: 10')
+    # Drop accidental blank-header columns (e.g., 'Unnamed: 10')
     merged = merged.loc[:, ~merged.columns.astype(str).str.startswith('Unnamed')]
 
-    # Optional: write a small QA CSV so you can review results easily
+    # Optional: quick preview CSV with the parsed results (for easy QA)
     try:
         qa = geocoded[[ADDR_COL, LAT_COL, LON_COL, STATUS_COL, CONF_COL]].copy()
         qa.to_csv('geocode_results_preview.csv', index=False)
