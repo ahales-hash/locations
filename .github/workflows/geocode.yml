@@ -1,104 +1,148 @@
-name: Geocode with Azure Maps
+name: Debug Geocode
 
 on:
-  workflow_dispatch:  # Run manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
-  geocode:
+  debug:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Pull your repository files
+      # 1) Checkout
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Install Python 3.11
+      # 2) Python runtime
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3) Install the few packages the script needs
+      # 3) Install deps
       - name: Install dependencies
         run: |
+          set -euxo pipefail
+          python -V
           python -m pip install --upgrade pip
           pip install pandas openpyxl requests
 
-      # 4) Verify both required files are present at the REPO ROOT
-      - name: Verify input files exist
+      # 4) Prove shell output + list files (and save it)
+      - name: DEBUG — shell output
         run: |
-          echo "Listing repo files:"
+          set -euxo pipefail
+          echo "DEBUG: runner is alive"
+          echo "DEBUG: pwd=$(pwd)"
+          echo "DEBUG: listing repo:"
           ls -la
-          if [ ! -f "azure_maps_batch_geocode_and_merge.py" ]; then
-            echo "❌ Missing: azure_maps_batch_geocode_and_merge.py at repo root"
-            exit 1
-          fi
-          if [ ! -f "Locations_geocode_ready.xlsx" ]; then
-            echo "❌ Missing: Locations_geocode_ready.xlsx at repo root"
-            exit 1
-          fi
-          echo "✔️ Both files found."
+          echo "DEBUG: done." | tee dbg_shell.log
 
-      # 5) (Optional) Probe your Azure Maps key BEFORE running the big batch
-      - name: Probe Azure Maps key (sanity test)
+      - name: Upload shell debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbg-shell
+          path: dbg_shell.log
+
+      # 5) One-address SYNC geocode + write Lat/Long back into the workbook
+      - name: DEBUG — inline Python sync geocode of first address
         env:
           AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
         run: |
-          set -e
-          cat > body.json << 'JSON'
-          {
-            "batchItems": [
-              {"query": "?query=1%20Microsoft%20Way%20Redmond%20WA&countrySet=US"}
-            ]
-          }
-          JSON
-          curl -sS -D headers.txt -o /dev/null \
-            -X POST "https://atlas.microsoft.com/search/address/batch/json?api-version=1.0&subscription-key=${AZURE_MAPS_KEY}" \
-            -H "Content-Type: application/json" \
-            --data @body.json
-          echo "---- Azure Maps status line (expect 202 Accepted) ----"
-          head -n1 headers.txt || true
+          set -euxo pipefail
+          python - <<'PY'
+import os, sys
+import pandas as pd
+import requests
 
-      # 6) Run your batch geocoding script (verbose + unbuffered), capture full output to a log
-      - name: Run batch geocoding
-        env:
-          AZURE_MAPS_KEY: ${{ secrets.AZURE_MAPS_KEY }}
-          PYTHONUNBUFFERED: '1'     # ensure Python prints immediately
-        run: |
-          set -euxo pipefail        # be chatty; fail fast; show commands
-          echo "Python version: $(python --version)"
-          echo "Repo contents:"; ls -la
-          echo "----- starting script at $(date -u) -----"
-          python -u azure_maps_batch_geocode_and_merge.py 2>&1 | tee geocode_step_output.log
-          echo "----- script finished at $(date -u) -----"
+print("PY: imports OK, pandas", pd.__version__)
+xlf = "Locations_geocode_ready.xlsx"
+print("PY: loading workbook:", xlf)
+df = pd.read_excel(xlf, sheet_name="Locations", engine="openpyxl")
+df.columns = [c.strip() for c in df.columns]
 
-      # 7) Upload the updated Excel workbook as a run artifact
+# Ensure required columns
+for c in ("Address","City","State","Zip"):
+    if c not in df.columns:
+        print("PY: ERROR missing column:", c)
+        open("py_dbg.txt","w").write(f"Missing column: {c}\n")
+        sys.exit(1)
+
+# Build FullAddress if missing
+if "FullAddress" not in df.columns:
+    def fmt_zip(z):
+        try:
+            return f"{int(str(z).split('.')[0]):05d}"
+        except Exception:
+            s = str(z).strip()
+            return s[:5] if s else ''
+    zc = df["Zip"].apply(fmt_zip)
+    df["FullAddress"] = (
+        df["Address"].astype(str).str.strip() + ", " +
+        df["City"].astype(str).str.strip() + ", " +
+        df["State"].astype(str).str.strip() + ", " + zc
+    )
+
+# Ensure Lat/Long columns exist
+for c in ("Lat","Long"):
+    if c not in df.columns:
+        df[c] = ""
+
+print("PY: row count:", len(df))
+addr = next((str(v).strip() for v in df["FullAddress"] if str(v).strip()), None)
+if not addr:
+    print("PY: no non-empty FullAddress found")
+    open("py_dbg.txt","w").write("No address found in FullAddress\n")
+    sys.exit(0)
+
+print("PY: probing Azure Maps sync search for:", addr)
+key = os.environ.get("AZURE_MAPS_KEY","")
+if not key:
+    print("PY: ERROR AZURE_MAPS_KEY is empty")
+    open("py_dbg.txt","w").write("AZURE_MAPS_KEY empty\n")
+    sys.exit(1)
+
+# SYNC search to prove key+network+write
+url = "https://atlas.microsoft.com/search/address/json"
+params = {"api-version":"1.0", "subscription-key":key, "query":addr, "countrySet":"US"}
+r = requests.get(url, params=params, timeout=30)
+print("PY: sync status:", r.status_code)
+if r.status_code != 200:
+    open("py_dbg.txt","w").write(f"sync status {r.status_code}\n{r.text[:500]}\n")
+    sys.exit(1)
+
+data = r.json()
+res = data.get("results") or []
+if not res:
+    print("PY: no results for:", addr)
+    open("py_dbg.txt","w").write("No results from sync search\n")
+    sys.exit(0)
+
+pos = res[0].get("position", {})
+lat, lon = pos.get("lat"), pos.get("lon")
+print("PY: got lat/lon:", lat, lon)
+
+# Write those into first matching row
+ix = df.index[df["FullAddress"]==addr][0]
+df.at[ix,"Lat"]  = lat
+df.at[ix,"Long"] = lon
+
+print("PY: writing workbook back:", xlf)
+with pd.ExcelWriter(xlf, engine="openpyxl", mode="w") as w:
+    df.to_excel(w, sheet_name="Locations", index=False)
+print("PY: done, workbook updated.")
+open("py_dbg.txt","w").write(f"Wrote {lat},{lon} for {addr}\n")
+PY
+
+      - name: Upload Python debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbg-python
+          path: py_dbg.txt
+
+      # 6) Upload the updated Excel workbook
       - name: Upload result workbook
         uses: actions/upload-artifact@v4
         with:
           name: geocoded-workbook
           path: Locations_geocode_ready.xlsx
-
-      # 8) Upload the geocode step log (so we can always review the full Python output)
-      - name: Upload geocode step log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: geocode-step-log
-          path: geocode_step_output.log
-
-      # 9) (Optional) Upload a quick results CSV if the script produced it
-      - name: Upload QA preview (if exists)
-        if: ${{ always() && hashFiles('geocode_results_preview.csv') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: geocode-results-preview
-          path: geocode_results_preview.csv
-
-      # 10) (Optional) Upload first-batch raw JSON if the script produced it
-      - name: Upload first-batch debug JSON (if exists)
-        if: ${{ always() && hashFiles('debug_first_batch.json') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-first-batch
-          path: debug_first_batch.json
