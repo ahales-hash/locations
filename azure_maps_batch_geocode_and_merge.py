@@ -17,6 +17,7 @@ Notes:
     Location URL until results are available (often returned directly as batchItems).
   - We check both 'Location' and 'Operation-Location' headers for robustness.
   - We honor 'Retry-After' headers while polling and allow up to 30 minutes.
+  - We merge query params into the returned Location URL to avoid duplicates.
   - BATCH_SIZE is 100 by default to reduce throttling and improve reliability.
 """
 
@@ -29,6 +30,7 @@ import pandas as pd
 import datetime as dt
 import requests
 from pathlib import Path
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # -------------------------
 # Configuration constants
@@ -102,6 +104,20 @@ def submit_batch(session, key, reqs):
     return op_loc
 
 
+def _merge_params_into_url(url, extra_params):
+    """
+    Merge extra_params into url's querystring without duplicating keys.
+    Returns a new URL.
+    """
+    parsed = urlparse(url)
+    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for k, v in extra_params.items():
+        if k not in q:
+            q[k] = v
+    new_query = urlencode(q)
+    return urlunparse(parsed._replace(query=new_query))
+
+
 def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=1800):
     """
     Poll the async batch URL until results are available or timeout.
@@ -112,8 +128,13 @@ def poll_batch(session, key, op_loc, poll_interval=2, timeout_sec=1800):
     """
     start = time.time()
     while True:
-        params = {'api-version': API_VERSION, 'subscription-key': key}
-        r = session.get(op_loc, params=params, timeout=60)
+        # Build a safe poll URL that includes any missing params (no duplicates).
+        poll_url = _merge_params_into_url(op_loc, {
+            'api-version': API_VERSION,
+            'subscription-key': key
+        })
+
+        r = session.get(poll_url, timeout=60)
 
         # Still running; service returns 202 with (often) no body.
         if r.status_code == 202:
